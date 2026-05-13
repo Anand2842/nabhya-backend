@@ -1,0 +1,344 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Nabhya NDVI Analyzer — Local Test</title>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet"/>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:        #0a0f1a;
+      --surface:   #111827;
+      --border:    rgba(255,255,255,.08);
+      --accent:    #22c55e;
+      --accent2:   #16a34a;
+      --red:       #ef4444;
+      --yellow:    #eab308;
+      --text:      #f1f5f9;
+      --muted:     #94a3b8;
+      --radius:    14px;
+    }
+
+    body {
+      font-family: 'Inter', sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 2rem 1rem 4rem;
+    }
+
+    header {
+      text-align: center;
+      margin-bottom: 2.5rem;
+    }
+    header h1 {
+      font-size: 2.4rem;
+      font-weight: 700;
+      background: linear-gradient(135deg, #22c55e, #4ade80, #a3e635);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      letter-spacing: -0.5px;
+    }
+    header p { color: var(--muted); margin-top: .5rem; font-size: .95rem; }
+
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 1.75rem;
+      width: 100%;
+      max-width: 860px;
+      margin-bottom: 1.5rem;
+    }
+
+    /* Drop zone */
+    #dropzone {
+      border: 2px dashed rgba(34,197,94,.4);
+      border-radius: 10px;
+      padding: 2.5rem;
+      text-align: center;
+      cursor: pointer;
+      transition: all .2s;
+      position: relative;
+    }
+    #dropzone:hover, #dropzone.drag-over {
+      border-color: var(--accent);
+      background: rgba(34,197,94,.05);
+    }
+    #dropzone input[type=file] {
+      position: absolute; inset: 0; opacity: 0; cursor: pointer;
+    }
+    #dropzone .icon { font-size: 3rem; margin-bottom: .75rem; }
+    #dropzone p { color: var(--muted); font-size: .9rem; }
+    #dropzone strong { color: var(--text); }
+
+    #preview-orig {
+      width: 100%;
+      max-height: 220px;
+      object-fit: contain;
+      border-radius: 8px;
+      display: none;
+      margin-top: 1rem;
+    }
+
+    button#analyzeBtn {
+      width: 100%;
+      padding: .85rem;
+      background: linear-gradient(135deg, var(--accent), var(--accent2));
+      border: none;
+      border-radius: 10px;
+      color: #fff;
+      font-size: 1rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: opacity .2s, transform .1s;
+      margin-top: 1rem;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: .5rem;
+    }
+    button#analyzeBtn:hover { opacity: .9; transform: translateY(-1px); }
+    button#analyzeBtn:disabled { opacity: .5; cursor: not-allowed; transform: none; }
+
+    /* Spinner */
+    .spinner {
+      width: 20px; height: 20px;
+      border: 3px solid rgba(255,255,255,.3);
+      border-top-color: #fff;
+      border-radius: 50%;
+      animation: spin .7s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* Results grid */
+    .results-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 1rem;
+    }
+    .result-img-wrap { text-align: center; }
+    .result-img-wrap label {
+      font-size: .8rem;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: .06em;
+      display: block;
+      margin-bottom: .5rem;
+    }
+    .result-img-wrap img {
+      width: 100%;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+    }
+
+    /* Stats row */
+    .stats-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+      gap: .75rem;
+      margin-top: .25rem;
+    }
+    .stat-card {
+      background: rgba(255,255,255,.04);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: .9rem 1rem;
+      text-align: center;
+    }
+    .stat-card .val {
+      font-size: 1.5rem;
+      font-weight: 700;
+      line-height: 1;
+    }
+    .stat-card .key { font-size: .75rem; color: var(--muted); margin-top: .3rem; }
+    .healthy  { color: var(--accent); }
+    .stressed { color: var(--yellow); }
+    .barren   { color: var(--red); }
+    .neutral  { color: #60a5fa; }
+
+    /* Legend bar */
+    .legend {
+      display: flex;
+      gap: .5rem;
+      margin-top: 1rem;
+      flex-wrap: wrap;
+    }
+    .legend-item {
+      display: flex;
+      align-items: center;
+      gap: .4rem;
+      font-size: .82rem;
+      color: var(--muted);
+    }
+    .legend-dot {
+      width: 12px; height: 12px;
+      border-radius: 50%;
+    }
+
+    /* Status bar */
+    #statusBar {
+      padding: .6rem 1rem;
+      border-radius: 8px;
+      font-size: .87rem;
+      margin-bottom: 1rem;
+      display: none;
+    }
+    #statusBar.error { background: rgba(239,68,68,.1); color: #fca5a5; border: 1px solid rgba(239,68,68,.3); }
+    #statusBar.info  { background: rgba(34,197,94,.08); color: #86efac; border: 1px solid rgba(34,197,94,.2); }
+
+    #results { display: none; }
+
+    footer { color: var(--muted); font-size: .8rem; margin-top: 2rem; }
+  </style>
+</head>
+<body>
+
+<header>
+  <div style="font-size:2.5rem; margin-bottom:.5rem;">🛰️</div>
+  <h1>Nabhya NDVI Analyzer</h1>
+  <p>Upload a satellite image → get crop health heatmap + statistics</p>
+</header>
+
+<div id="statusBar"></div>
+
+<!-- Upload card -->
+<div class="card">
+  <div id="dropzone" ondragover="ev.preventDefault();this.classList.add('drag-over')"
+       ondragleave="this.classList.remove('drag-over')"
+       ondrop="handleDrop(event)">
+    <input type="file" id="fileInput" accept="image/*" onchange="handleFile(this.files[0])"/>
+    <div class="icon">📡</div>
+    <strong>Drop satellite image here</strong>
+    <p>or click to browse — JPG / PNG / TIF</p>
+  </div>
+  <img id="preview-orig" alt="preview"/>
+  <button id="analyzeBtn" onclick="analyze()" disabled>
+    <span>Analyze Crop Health</span>
+  </button>
+</div>
+
+<!-- Results -->
+<div class="card" id="results">
+  <h2 style="font-size:1.1rem; margin-bottom:1.25rem;">📊 Analysis Results</h2>
+
+  <div class="results-grid">
+    <div class="result-img-wrap">
+      <label>Original</label>
+      <img id="imgOrig" alt="original"/>
+    </div>
+    <div class="result-img-wrap">
+      <label>NDVI Heatmap</label>
+      <img id="imgHeatmap" alt="heatmap"/>
+    </div>
+    <div class="result-img-wrap">
+      <label>Overlay</label>
+      <img id="imgOverlay" alt="overlay"/>
+    </div>
+  </div>
+
+  <div class="legend">
+    <div class="legend-item"><div class="legend-dot" style="background:#22c55e"></div> Healthy vegetation (NDVI &gt; 0.3)</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#eab308"></div> Stressed (0.1 – 0.3)</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#ef4444"></div> Barren / non-veg (≤ 0.1)</div>
+  </div>
+
+  <h3 style="font-size:.9rem; color:var(--muted); margin: 1.5rem 0 .75rem; text-transform:uppercase; letter-spacing:.06em;">Statistics</h3>
+  <div class="stats-grid">
+    <div class="stat-card"><div class="val neutral" id="sMean">—</div><div class="key">Mean NDVI</div></div>
+    <div class="stat-card"><div class="val neutral" id="sMax">—</div><div class="key">Max NDVI</div></div>
+    <div class="stat-card"><div class="val neutral" id="sMin">—</div><div class="key">Min NDVI</div></div>
+    <div class="stat-card"><div class="val healthy" id="sHealthy">—</div><div class="key">Healthy %</div></div>
+    <div class="stat-card"><div class="val stressed" id="sStressed">—</div><div class="key">Stressed %</div></div>
+    <div class="stat-card"><div class="val barren" id="sBarren">—</div><div class="key">Barren %</div></div>
+  </div>
+
+  <p id="modelNote" style="margin-top:1rem; font-size:.8rem; color:var(--muted); text-align:center;"></p>
+</div>
+
+<footer>Local test UI — API at <span id="apiBase" style="color:var(--accent)">http://localhost:8000</span></footer>
+
+<script>
+  const API = "http://localhost:8000";
+  let selectedFile = null;
+
+  function status(msg, type="info") {
+    const el = document.getElementById("statusBar");
+    el.textContent = msg;
+    el.className = type;
+    el.style.display = "block";
+  }
+
+  function handleDrop(ev) {
+    ev.preventDefault();
+    document.getElementById("dropzone").classList.remove("drag-over");
+    const f = ev.dataTransfer.files[0];
+    if (f) handleFile(f);
+  }
+
+  function handleFile(f) {
+    if (!f) return;
+    selectedFile = f;
+    const reader = new FileReader();
+    reader.onload = e => {
+      const img = document.getElementById("preview-orig");
+      img.src = e.target.result;
+      img.style.display = "block";
+    };
+    reader.readAsDataURL(f);
+    document.getElementById("analyzeBtn").disabled = false;
+    document.getElementById("statusBar").style.display = "none";
+  }
+
+  async function analyze() {
+    if (!selectedFile) return;
+    const btn = document.getElementById("analyzeBtn");
+    btn.disabled = true;
+    btn.innerHTML = `<div class="spinner"></div><span>Analyzing…</span>`;
+    document.getElementById("results").style.display = "none";
+
+    const form = new FormData();
+    form.append("file", selectedFile);
+
+    try {
+      const res = await fetch(`${API}/analyze`, { method: "POST", body: form });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.detail || `HTTP ${res.status}`);
+      }
+      const data = await res.json();
+
+      document.getElementById("imgOrig").src     = "data:image/png;base64," + data.original_base64;
+      document.getElementById("imgHeatmap").src  = "data:image/png;base64," + data.heatmap_base64;
+      document.getElementById("imgOverlay").src  = "data:image/png;base64," + data.overlay_base64;
+
+      const s = data.statistics;
+      document.getElementById("sMean").textContent    = s.mean_ndvi;
+      document.getElementById("sMax").textContent     = s.max_ndvi;
+      document.getElementById("sMin").textContent     = s.min_ndvi;
+      document.getElementById("sHealthy").textContent  = s.healthy_pct + "%";
+      document.getElementById("sStressed").textContent = s.stressed_pct + "%";
+      document.getElementById("sBarren").textContent   = s.barren_pct + "%";
+
+      document.getElementById("modelNote").textContent =
+        data.model_used
+          ? "✅ Inference ran on trained NDVI Generator model"
+          : "⚠️  Model not loaded — results from NDVI approximation fallback";
+
+      document.getElementById("results").style.display = "block";
+      status("Analysis complete!", "info");
+    } catch(e) {
+      status("Error: " + e.message + " — is the API running on port 8000?", "error");
+    } finally {
+      btn.disabled = false;
+      btn.innerHTML = "<span>Analyze Crop Health</span>";
+    }
+  }
+</script>
+</body>
+</html>

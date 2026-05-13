@@ -1,0 +1,258 @@
+"""
+Nabhya NDVI Analysis API
+FastAPI backend that loads a trained PyTorch Generator model
+and returns NDVI heatmap overlays for uploaded satellite images.
+"""
+
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+from PIL import Image
+import torch
+import torch.nn as nn
+import torchvision.transforms as transforms
+import numpy as np
+import io
+import base64
+import logging
+import os
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+app = FastAPI(
+    title="Nabhya NDVI API",
+    description="Satellite image → NDVI heatmap using a trained GAN Generator",
+    version="1.0.0"
+)
+
+# ── CORS (allow Antigravity / Lovable frontend) ──────────────────────────────
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ── Device ───────────────────────────────────────────────────────────────────
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+logger.info(f"Running on device: {DEVICE}")
+
+# ── Model path ───────────────────────────────────────────────────────────────
+MODEL_PATH = os.environ.get(
+    "MODEL_PATH",
+    os.path.join(os.path.dirname(__file__), "..", "best_model (1).pth")
+)
+
+# ── Generator Architecture ────────────────────────────────────────────────────
+# Standard U-Net-style generator commonly used in pix2pix / NDVI GAN papers.
+# If your architecture differs, swap in your own Generator class here.
+
+class UNetBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, down=True, use_bn=True, dropout=False, relu=True):
+        super().__init__()
+        layers = []
+        if down:
+            layers.append(nn.Conv2d(in_channels, out_channels, 4, 2, 1, bias=not use_bn))
+        else:
+            layers.append(nn.ConvTranspose2d(in_channels, out_channels, 4, 2, 1, bias=not use_bn))
+        if use_bn:
+            layers.append(nn.BatchNorm2d(out_channels))
+        if relu:
+            layers.append(nn.ReLU(inplace=True) if not down else nn.LeakyReLU(0.2, inplace=True))
+        if dropout:
+            layers.append(nn.Dropout(0.5))
+        self.block = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.block(x)
+
+
+class Generator(nn.Module):
+    """
+    Pix2Pix-style U-Net Generator: RGB (3ch) → single-channel NDVI map.
+    Input:  (B, 3, 256, 256)
+    Output: (B, 1, 256, 256)  values in [-1, 1], mapped to [0, 1] NDVI
+    """
+    def __init__(self, in_channels=3, out_channels=1, features=64):
+        super().__init__()
+        # Encoder
+        self.down1 = nn.Sequential(nn.Conv2d(in_channels, features, 4, 2, 1), nn.LeakyReLU(0.2))
+        self.down2 = UNetBlock(features,     features*2)
+        self.down3 = UNetBlock(features*2,   features*4)
+        self.down4 = UNetBlock(features*4,   features*8)
+        self.down5 = UNetBlock(features*8,   features*8)
+        self.down6 = UNetBlock(features*8,   features*8)
+        self.down7 = UNetBlock(features*8,   features*8)
+        self.bottleneck = nn.Sequential(nn.Conv2d(features*8, features*8, 4, 2, 1), nn.ReLU())
+        # Decoder
+        self.up1 = UNetBlock(features*8,   features*8, down=False, dropout=True)
+        self.up2 = UNetBlock(features*8*2, features*8, down=False, dropout=True)
+        self.up3 = UNetBlock(features*8*2, features*8, down=False, dropout=True)
+        self.up4 = UNetBlock(features*8*2, features*8, down=False)
+        self.up5 = UNetBlock(features*8*2, features*4, down=False)
+        self.up6 = UNetBlock(features*4*2, features*2, down=False)
+        self.up7 = UNetBlock(features*2*2, features,   down=False)
+        self.final = nn.Sequential(
+            nn.ConvTranspose2d(features*2, out_channels, 4, 2, 1),
+            nn.Tanh()
+        )
+
+    def forward(self, x):
+        d1 = self.down1(x)
+        d2 = self.down2(d1)
+        d3 = self.down3(d2)
+        d4 = self.down4(d3)
+        d5 = self.down5(d4)
+        d6 = self.down6(d5)
+        d7 = self.down7(d6)
+        bottleneck = self.bottleneck(d7)
+        up1 = self.up1(bottleneck)
+        up2 = self.up2(torch.cat([up1, d7], 1))
+        up3 = self.up3(torch.cat([up2, d6], 1))
+        up4 = self.up4(torch.cat([up3, d5], 1))
+        up5 = self.up5(torch.cat([up4, d4], 1))
+        up6 = self.up6(torch.cat([up5, d3], 1))
+        up7 = self.up7(torch.cat([up6, d2], 1))
+        return self.final(torch.cat([up7, d1], 1))
+
+
+# ── NDVI colormap (RdYlGn) ────────────────────────────────────────────────────
+def ndvi_colormap(ndvi_norm: np.ndarray) -> np.ndarray:
+    """Map [0,1] NDVI values to an RdYlGn-style RGB heatmap."""
+    ndvi_norm = np.clip(ndvi_norm, 0, 1)
+    r = np.where(ndvi_norm < 0.5, 1.0, 1.0 - (ndvi_norm - 0.5) * 2)
+    g = np.where(ndvi_norm < 0.5, ndvi_norm * 2, 1.0)
+    b = np.zeros_like(ndvi_norm)
+    rgb = np.stack([r, g, b], axis=-1)
+    return (rgb * 255).astype(np.uint8)
+
+
+# ── Model loading ─────────────────────────────────────────────────────────────
+model: Generator | None = None
+
+@app.on_event("startup")
+async def load_model():
+    global model
+    try:
+        logger.info(f"Loading model from: {MODEL_PATH}")
+        checkpoint = torch.load(MODEL_PATH, map_location=DEVICE)
+
+        gen = Generator().to(DEVICE)
+
+        # Handle different checkpoint formats
+        if isinstance(checkpoint, dict):
+            sd = (
+                checkpoint.get("generator_state_dict")
+                or checkpoint.get("model_state_dict")
+                or checkpoint.get("state_dict")
+                or checkpoint.get("gen")
+                or checkpoint
+            )
+        else:
+            sd = checkpoint
+
+        gen.load_state_dict(sd, strict=False)
+        gen.eval()
+        model = gen
+        logger.info("✅ Model loaded successfully")
+    except Exception as e:
+        logger.error(f"❌ Model load failed: {e}")
+        logger.warning("Running with MOCK predictions — replace model path to fix.")
+        model = None
+
+
+# ── Image pre-processing ──────────────────────────────────────────────────────
+INPUT_SIZE = 256
+transform = transforms.Compose([
+    transforms.Resize((INPUT_SIZE, INPUT_SIZE)),
+    transforms.ToTensor(),
+    transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])
+])
+
+
+def encode_image(img: Image.Image) -> str:
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return base64.b64encode(buf.getvalue()).decode()
+
+
+def compute_statistics(ndvi_arr: np.ndarray) -> dict:
+    return {
+        "mean_ndvi":   round(float(np.mean(ndvi_arr)), 4),
+        "max_ndvi":    round(float(np.max(ndvi_arr)), 4),
+        "min_ndvi":    round(float(np.min(ndvi_arr)), 4),
+        "healthy_pct": round(float(np.mean(ndvi_arr > 0.3)) * 100, 2),
+        "stressed_pct": round(float(np.mean((ndvi_arr > 0.1) & (ndvi_arr <= 0.3))) * 100, 2),
+        "barren_pct":  round(float(np.mean(ndvi_arr <= 0.1)) * 100, 2),
+    }
+
+
+# ── Routes ────────────────────────────────────────────────────────────────────
+
+@app.get("/")
+def home():
+    return {
+        "message": "Nabhya NDVI API Running",
+        "model_loaded": model is not None,
+        "device": str(DEVICE),
+        "docs": "/docs"
+    }
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "model_ready": model is not None}
+
+
+@app.post("/analyze")
+async def analyze(file: UploadFile = File(...)):
+    """
+    Upload a satellite image (JPG/PNG) and receive:
+    - NDVI heatmap (base64 PNG)
+    - Overlay image blended with original (base64 PNG)
+    - Per-pixel NDVI statistics
+    """
+    if not file.content_type.startswith("image/"):
+        raise HTTPException(400, "Only image files are accepted (JPEG/PNG).")
+
+    contents = await file.read()
+    try:
+        orig = Image.open(io.BytesIO(contents)).convert("RGB")
+    except Exception:
+        raise HTTPException(400, "Cannot decode uploaded file as an image.")
+
+    orig_resized = orig.resize((INPUT_SIZE, INPUT_SIZE))
+
+    # ── Inference ────────────────────────────────────────────────────────────
+    if model is not None:
+        tensor = transform(orig).unsqueeze(0).to(DEVICE)
+        with torch.no_grad():
+            pred = model(tensor)                       # (1, 1, H, W) in [-1, 1]
+        ndvi_arr = (pred.squeeze().cpu().numpy() + 1) / 2  # → [0, 1]
+    else:
+        # Graceful mock: compute rough NDVI-like map from R/G channels
+        arr = np.array(orig_resized).astype(np.float32) / 255.0
+        nir_approx = arr[:, :, 1]          # green ≈ NIR proxy
+        red = arr[:, :, 0]
+        denom = nir_approx + red + 1e-6
+        ndvi_arr = np.clip((nir_approx - red) / denom, 0, 1)
+
+    # ── Colormap heatmap ──────────────────────────────────────────────────────
+    heatmap_rgb = ndvi_colormap(ndvi_arr)
+    heatmap_img = Image.fromarray(heatmap_rgb)
+
+    # ── Blended overlay ───────────────────────────────────────────────────────
+    overlay = Image.blend(orig_resized.convert("RGB"), heatmap_img, alpha=0.55)
+
+    stats = compute_statistics(ndvi_arr)
+
+    return JSONResponse({
+        "status": "success",
+        "model_used": model is not None,
+        "statistics": stats,
+        "heatmap_base64":  encode_image(heatmap_img),
+        "overlay_base64":  encode_image(overlay),
+        "original_base64": encode_image(orig_resized),
+    })
