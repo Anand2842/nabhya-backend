@@ -58,9 +58,9 @@ logger.info(f"Running on device: {DEVICE}")
 
 def resolve_model_path() -> str:
     """Download from HF Hub if env vars present, else fall back to local path."""
-    repo_id  = os.environ.get("HF_REPO_ID", "").strip()
-    hf_token = os.environ.get("HF_TOKEN", "").strip()
-    filename = os.environ.get("HF_FILENAME", "best_model.pth").strip()
+    repo_id  = os.environ.get("HF_REPO_ID",   "Anand2842/ndvi_ieee").strip()
+    hf_token = os.environ.get("HF_TOKEN",      "").strip()
+    filename = os.environ.get("HF_FILENAME",   "best_model (1).pth").strip()
 
     if repo_id and HF_HUB_AVAILABLE:
         logger.info(f"Downloading model from HuggingFace Hub: {repo_id}/{filename}")
