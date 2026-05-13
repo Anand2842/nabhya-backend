@@ -2,6 +2,10 @@
 Nabhya NDVI Analysis API
 FastAPI backend that loads a trained PyTorch Generator model
 and returns NDVI heatmap overlays for uploaded satellite images.
+
+Model source priority:
+  1. HuggingFace Hub  — set HF_REPO_ID + HF_TOKEN (+ optionally HF_FILENAME)
+  2. Local path       — set MODEL_PATH env var (or uses sibling best_model.pth)
 """
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
@@ -16,6 +20,12 @@ import io
 import base64
 import logging
 import os
+
+try:
+    from huggingface_hub import hf_hub_download
+    HF_HUB_AVAILABLE = True
+except ImportError:
+    HF_HUB_AVAILABLE = False
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -39,11 +49,36 @@ app.add_middleware(
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 logger.info(f"Running on device: {DEVICE}")
 
-# ── Model path ───────────────────────────────────────────────────────────────
-MODEL_PATH = os.environ.get(
-    "MODEL_PATH",
-    os.path.join(os.path.dirname(__file__), "..", "best_model (1).pth")
-)
+# ── Model resolution ─────────────────────────────────────────────────────────
+# Env vars (set these as Railway secrets — never hardcode):
+#   HF_REPO_ID   e.g.  Anand2842/nabhya-ndvi
+#   HF_FILENAME  e.g.  best_model.pth          (default: best_model.pth)
+#   HF_TOKEN     your HuggingFace read token
+#   MODEL_PATH   local fallback path
+
+def resolve_model_path() -> str:
+    """Download from HF Hub if env vars present, else fall back to local path."""
+    repo_id  = os.environ.get("HF_REPO_ID", "").strip()
+    hf_token = os.environ.get("HF_TOKEN", "").strip()
+    filename = os.environ.get("HF_FILENAME", "best_model.pth").strip()
+
+    if repo_id and HF_HUB_AVAILABLE:
+        logger.info(f"Downloading model from HuggingFace Hub: {repo_id}/{filename}")
+        local = hf_hub_download(
+            repo_id=repo_id,
+            filename=filename,
+            token=hf_token or None,
+        )
+        logger.info(f"Model cached at: {local}")
+        return local
+
+    # Local fallback
+    local_path = os.environ.get(
+        "MODEL_PATH",
+        os.path.join(os.path.dirname(__file__), "..", "best_model (1).pth")
+    )
+    logger.info(f"Using local model path: {local_path}")
+    return local_path
 
 # ── Generator Architecture ────────────────────────────────────────────────────
 # Standard U-Net-style generator commonly used in pix2pix / NDVI GAN papers.
@@ -136,12 +171,13 @@ model: Generator | None = None
 async def load_model():
     global model
     try:
-        logger.info(f"Loading model from: {MODEL_PATH}")
-        checkpoint = torch.load(MODEL_PATH, map_location=DEVICE)
+        model_path = resolve_model_path()
+        logger.info(f"Loading checkpoint: {model_path}")
+        checkpoint = torch.load(model_path, map_location=DEVICE)
 
         gen = Generator().to(DEVICE)
 
-        # Handle different checkpoint formats
+        # Handle different checkpoint formats gracefully
         if isinstance(checkpoint, dict):
             sd = (
                 checkpoint.get("generator_state_dict")
@@ -159,7 +195,7 @@ async def load_model():
         logger.info("✅ Model loaded successfully")
     except Exception as e:
         logger.error(f"❌ Model load failed: {e}")
-        logger.warning("Running with MOCK predictions — replace model path to fix.")
+        logger.warning("Running with MOCK predictions — set HF_REPO_ID + HF_TOKEN or MODEL_PATH.")
         model = None
 
 
