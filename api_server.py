@@ -186,9 +186,9 @@ def postprocess_ndvi(ndvi_arr: np.ndarray) -> np.ndarray:
         ndvi_arr = (ndvi_arr - p2) / (p98 - p2)
     ndvi_arr = np.clip(ndvi_arr, 0, 1)
 
-    # ── Gaussian smooth via PIL (simulates bilateral, removes speckle) ───────
+    # ── Median filter (edge-preserving, removes speckle without smearing) ────
     smooth_img = Image.fromarray((ndvi_arr * 255).astype(np.uint8), mode='L')
-    smooth_img = smooth_img.filter(ImageFilter.GaussianBlur(radius=1.2))
+    smooth_img = smooth_img.filter(ImageFilter.MedianFilter(size=3))
     ndvi_arr = np.array(smooth_img).astype(np.float32) / 255.0
 
     return ndvi_arr
@@ -294,7 +294,7 @@ async def analyze(file: UploadFile = File(...)):
 
     # ── Inference ────────────────────────────────────────────────────────────
     if model is not None:
-        tensor = transform(orig).unsqueeze(0).to(DEVICE)
+        tensor = transform(orig_resized).unsqueeze(0).to(DEVICE)
         with torch.no_grad():
             pred = model(tensor)                       # (1, 1, H, W) in [-1, 1]
         ndvi_arr = 1.0 - (pred.squeeze().cpu().numpy() + 1) / 2  # model: -1=veg, +1=barren → flip
@@ -306,9 +306,11 @@ async def analyze(file: UploadFile = File(...)):
         denom = nir_approx + red + 1e-6
         ndvi_arr = np.clip((nir_approx - red) / denom, 0, 1)
 
-    # ── Post-processing pipeline ─────────────────────────────────────────────
-    ndvi_arr = postprocess_ndvi(ndvi_arr)
+    # ── Statistics on raw NDVI (before stretch, so thresholds are meaningful) ─
     stats = compute_statistics(ndvi_arr)
+
+    # ── Post-processing for visualization only ───────────────────────────────
+    ndvi_arr = postprocess_ndvi(ndvi_arr)
 
     # ── Colormap heatmap ──────────────────────────────────────────────────────
     heatmap_rgb = ndvi_colormap(ndvi_arr)
