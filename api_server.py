@@ -246,12 +246,13 @@ def encode_image(img: Image.Image) -> str:
 
 def compute_statistics(ndvi_arr: np.ndarray) -> dict:
     return {
-        "mean_ndvi":   round(float(np.mean(ndvi_arr)), 4),
-        "max_ndvi":    round(float(np.max(ndvi_arr)), 4),
-        "min_ndvi":    round(float(np.min(ndvi_arr)), 4),
-        "healthy_pct": round(float(np.mean(ndvi_arr > 0.3)) * 100, 2),
-        "stressed_pct": round(float(np.mean((ndvi_arr > 0.1) & (ndvi_arr <= 0.3))) * 100, 2),
-        "barren_pct":  round(float(np.mean(ndvi_arr <= 0.1)) * 100, 2),
+        "mean_ndvi":    round(float(np.mean(ndvi_arr)), 4),
+        "max_ndvi":     round(float(np.max(ndvi_arr)), 4),
+        "min_ndvi":     round(float(np.min(ndvi_arr)), 4),
+        # Real-world NDVI thresholds: >0.6 healthy, 0.3-0.6 stressed, <0.3 barren
+        "healthy_pct":  round(float(np.mean(ndvi_arr > 0.6)) * 100, 2),
+        "stressed_pct": round(float(np.mean((ndvi_arr >= 0.3) & (ndvi_arr <= 0.6))) * 100, 2),
+        "barren_pct":   round(float(np.mean(ndvi_arr < 0.3)) * 100, 2),
     }
 
 
