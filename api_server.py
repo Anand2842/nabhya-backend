@@ -297,7 +297,7 @@ async def analyze(file: UploadFile = File(...)):
         tensor = transform(orig).unsqueeze(0).to(DEVICE)
         with torch.no_grad():
             pred = model(tensor)                       # (1, 1, H, W) in [-1, 1]
-        ndvi_arr = (pred.squeeze().cpu().numpy() + 1) / 2  # → [0, 1]
+        ndvi_arr = 1.0 - (pred.squeeze().cpu().numpy() + 1) / 2  # model: -1=veg, +1=barren → flip
     else:
         # Graceful mock: compute rough NDVI-like map from R/G channels
         arr = np.array(orig_resized).astype(np.float32) / 255.0
