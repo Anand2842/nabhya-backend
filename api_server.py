@@ -11,7 +11,7 @@ Model source priority:
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from PIL import Image
+from PIL import Image, ImageFilter
 import torch
 import torch.nn as nn
 import torchvision.transforms as transforms
@@ -153,15 +153,45 @@ class Generator(nn.Module):
         return self.final(torch.cat([up7, d1], 1))
 
 
-# ── NDVI colormap (RdYlGn) ────────────────────────────────────────────────────
+# ── NDVI colormap (RdYlGn — multi-stop, matplotlib-equivalent) ────────────────
 def ndvi_colormap(ndvi_norm: np.ndarray) -> np.ndarray:
-    """Map [0,1] NDVI values to an RdYlGn-style RGB heatmap."""
+    """Map [0,1] NDVI values to a proper RdYlGn RGB heatmap with 6 color stops."""
     ndvi_norm = np.clip(ndvi_norm, 0, 1)
-    r = np.where(ndvi_norm < 0.5, 1.0, 1.0 - (ndvi_norm - 0.5) * 2)
-    g = np.where(ndvi_norm < 0.5, ndvi_norm * 2, 1.0)
-    b = np.zeros_like(ndvi_norm)
+    # 6-stop RdYlGn: deep red → red → orange → yellow → yellow-green → green
+    stops = np.array([
+        [0.0,  0.647, 0.059, 0.082],  # #a50f15  deep red
+        [0.2,  0.906, 0.259, 0.204],  # #e74233  red
+        [0.4,  0.992, 0.682, 0.318],  # #fdae51  orange
+        [0.5,  1.000, 1.000, 0.600],  # #ffff99  yellow
+        [0.7,  0.651, 0.851, 0.416],  # #a6d96a  yellow-green
+        [0.85, 0.263, 0.671, 0.278],  # #43ab47  green
+        [1.0,  0.004, 0.408, 0.216],  # #016837  dark green
+    ])
+    r = np.interp(ndvi_norm, stops[:, 0], stops[:, 1])
+    g = np.interp(ndvi_norm, stops[:, 0], stops[:, 2])
+    b = np.interp(ndvi_norm, stops[:, 0], stops[:, 3])
     rgb = np.stack([r, g, b], axis=-1)
     return (rgb * 255).astype(np.uint8)
+
+
+def postprocess_ndvi(ndvi_arr: np.ndarray) -> np.ndarray:
+    """Post-processing pipeline per Evion spec:
+    1. Percentile-based histogram stretch (use full [0,1] range)
+    2. Gaussian smooth (edge-preserving via PIL)
+    """
+    # ── Histogram stretch (2nd–98th percentile) ──────────────────────────────
+    p2  = np.percentile(ndvi_arr, 2)
+    p98 = np.percentile(ndvi_arr, 98)
+    if (p98 - p2) > 0.01:
+        ndvi_arr = (ndvi_arr - p2) / (p98 - p2)
+    ndvi_arr = np.clip(ndvi_arr, 0, 1)
+
+    # ── Gaussian smooth via PIL (simulates bilateral, removes speckle) ───────
+    smooth_img = Image.fromarray((ndvi_arr * 255).astype(np.uint8), mode='L')
+    smooth_img = smooth_img.filter(ImageFilter.GaussianBlur(radius=1.2))
+    ndvi_arr = np.array(smooth_img).astype(np.float32) / 255.0
+
+    return ndvi_arr
 
 
 # ── Model loading ─────────────────────────────────────────────────────────────
@@ -260,13 +290,14 @@ async def analyze(file: UploadFile = File(...)):
         raise HTTPException(400, "Cannot decode uploaded file as an image.")
 
     orig_resized = orig.resize((INPUT_SIZE, INPUT_SIZE))
+    OUTPUT_SIZE = 512  # upscale for sharper display
 
     # ── Inference ────────────────────────────────────────────────────────────
     if model is not None:
         tensor = transform(orig).unsqueeze(0).to(DEVICE)
         with torch.no_grad():
             pred = model(tensor)                       # (1, 1, H, W) in [-1, 1]
-        ndvi_arr = 1.0 - (pred.squeeze().cpu().numpy() + 1) / 2  # → [0, 1] inverted (model: +1=barren, -1=veg)
+        ndvi_arr = (pred.squeeze().cpu().numpy() + 1) / 2  # → [0, 1]
     else:
         # Graceful mock: compute rough NDVI-like map from R/G channels
         arr = np.array(orig_resized).astype(np.float32) / 255.0
@@ -275,14 +306,24 @@ async def analyze(file: UploadFile = File(...)):
         denom = nir_approx + red + 1e-6
         ndvi_arr = np.clip((nir_approx - red) / denom, 0, 1)
 
+    # ── Post-processing pipeline ─────────────────────────────────────────────
+    ndvi_arr = postprocess_ndvi(ndvi_arr)
+    stats = compute_statistics(ndvi_arr)
+
     # ── Colormap heatmap ──────────────────────────────────────────────────────
     heatmap_rgb = ndvi_colormap(ndvi_arr)
     heatmap_img = Image.fromarray(heatmap_rgb)
 
-    # ── Blended overlay ───────────────────────────────────────────────────────
-    overlay = Image.blend(orig_resized.convert("RGB"), heatmap_img, alpha=0.55)
+    # ── Upscale 256 → 512 (sharper display without re-running model) ─────────
+    heatmap_img = heatmap_img.resize((OUTPUT_SIZE, OUTPUT_SIZE), Image.LANCZOS)
+    orig_display = orig_resized.resize((OUTPUT_SIZE, OUTPUT_SIZE), Image.LANCZOS)
 
-    stats = compute_statistics(ndvi_arr)
+    # ── HSV saturation boost ×1.4 (per pipeline spec) ────────────────────────
+    from PIL import ImageEnhance
+    heatmap_img = ImageEnhance.Color(heatmap_img).enhance(1.4)
+
+    # ── Blended overlay ───────────────────────────────────────────────────────
+    overlay = Image.blend(orig_display.convert("RGB"), heatmap_img, alpha=0.55)
 
     return JSONResponse({
         "status": "success",
@@ -290,5 +331,5 @@ async def analyze(file: UploadFile = File(...)):
         "statistics": stats,
         "heatmap_base64":  encode_image(heatmap_img),
         "overlay_base64":  encode_image(overlay),
-        "original_base64": encode_image(orig_resized),
+        "original_base64": encode_image(orig_display),
     })
