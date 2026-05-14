@@ -280,8 +280,9 @@ async def analyze(file: UploadFile = File(...)):
     - Overlay image blended with original (base64 PNG)
     - Per-pixel NDVI statistics
     """
-    if not file.content_type.startswith("image/"):
-        raise HTTPException(400, "Only image files are accepted (JPEG/PNG).")
+    valid_exts = (".jpg", ".jpeg", ".png", ".tif", ".tiff")
+    if not file.content_type.startswith("image/") and not file.filename.lower().endswith(valid_exts):
+        raise HTTPException(400, "Only image files are accepted (JPEG/PNG/TIFF).")
 
     contents = await file.read()
     try:
