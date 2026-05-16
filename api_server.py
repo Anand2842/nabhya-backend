@@ -81,91 +81,103 @@ def resolve_model_path() -> str:
     return local_path
 
 # ── Generator Architecture ────────────────────────────────────────────────────
-# Standard U-Net-style generator commonly used in pix2pix / NDVI GAN papers.
-# If your architecture differs, swap in your own Generator class here.
+# Exact architecture from the Kaggle evaluation notebook (Nabhya model).
+# Layer names (e1..e7, d1..d7) and internal structure (conv/dropout)
+# MUST match the checkpoint's state_dict keys exactly.
 
 class UNetBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, down=True, use_bn=True, dropout=False, relu=True):
+    def __init__(self, in_ch, out_ch, down=True, use_dropout=False):
         super().__init__()
-        layers = []
         if down:
-            layers.append(nn.Conv2d(in_channels, out_channels, 4, 2, 1, bias=not use_bn))
+            self.conv = nn.Sequential(
+                nn.Conv2d(in_ch, out_ch, 4, 2, 1, bias=False),
+                nn.BatchNorm2d(out_ch),
+                nn.LeakyReLU(0.2, inplace=True))
         else:
-            layers.append(nn.ConvTranspose2d(in_channels, out_channels, 4, 2, 1, bias=not use_bn))
-        if use_bn:
-            layers.append(nn.BatchNorm2d(out_channels))
-        if relu:
-            layers.append(nn.ReLU(inplace=True) if not down else nn.LeakyReLU(0.2, inplace=True))
-        if dropout:
-            layers.append(nn.Dropout(0.5))
-        self.block = nn.Sequential(*layers)
-
+            self.conv = nn.Sequential(
+                nn.ConvTranspose2d(in_ch, out_ch, 4, 2, 1, bias=False),
+                nn.BatchNorm2d(out_ch),
+                nn.ReLU(inplace=True))
+        self.dropout = nn.Dropout(0.5) if use_dropout else nn.Identity()
     def forward(self, x):
-        return self.block(x)
+        return self.dropout(self.conv(x))
 
 
 class Generator(nn.Module):
     """
-    Pix2Pix-style U-Net Generator: RGB (3ch) → single-channel NDVI map.
+    Pix2Pix-style U-Net Generator: RGB (3ch) → 3-channel NDVI visualization.
+    Architecture matches the Kaggle evaluation checkpoint exactly.
     Input:  (B, 3, 256, 256)
-    Output: (B, 1, 256, 256)  values in [-1, 1], mapped to [0, 1] NDVI
+    Output: (B, 3, 256, 256)  values in [-1, 1]
     """
-    def __init__(self, in_channels=3, out_channels=1, features=64):
+    def __init__(self):
         super().__init__()
-        # Encoder
-        self.down1 = nn.Sequential(nn.Conv2d(in_channels, features, 4, 2, 1), nn.LeakyReLU(0.2))
-        self.down2 = UNetBlock(features,     features*2)
-        self.down3 = UNetBlock(features*2,   features*4)
-        self.down4 = UNetBlock(features*4,   features*8)
-        self.down5 = UNetBlock(features*8,   features*8)
-        self.down6 = UNetBlock(features*8,   features*8)
-        self.down7 = UNetBlock(features*8,   features*8)
-        self.bottleneck = nn.Sequential(nn.Conv2d(features*8, features*8, 4, 2, 1), nn.ReLU())
-        # Decoder
-        self.up1 = UNetBlock(features*8,   features*8, down=False, dropout=True)
-        self.up2 = UNetBlock(features*8*2, features*8, down=False, dropout=True)
-        self.up3 = UNetBlock(features*8*2, features*8, down=False, dropout=True)
-        self.up4 = UNetBlock(features*8*2, features*8, down=False)
-        self.up5 = UNetBlock(features*8*2, features*4, down=False)
-        self.up6 = UNetBlock(features*4*2, features*2, down=False)
-        self.up7 = UNetBlock(features*2*2, features,   down=False)
-        self.final = nn.Sequential(
-            nn.ConvTranspose2d(features*2, out_channels, 4, 2, 1),
-            nn.Tanh()
-        )
+        self.e1 = nn.Sequential(nn.Conv2d(3, 64, 4, 2, 1), nn.LeakyReLU(0.2))
+        self.e2 = UNetBlock(64, 128)
+        self.e3 = UNetBlock(128, 256)
+        self.e4 = UNetBlock(256, 512)
+        self.e5 = UNetBlock(512, 512)
+        self.e6 = UNetBlock(512, 512)
+        self.e7 = UNetBlock(512, 512)
+        self.bottleneck = nn.Sequential(nn.Conv2d(512, 512, 4, 2, 1), nn.ReLU())
+        self.d1 = UNetBlock(512, 512, False, True)
+        self.d2 = UNetBlock(1024, 512, False, True)
+        self.d3 = UNetBlock(1024, 512, False, True)
+        self.d4 = UNetBlock(1024, 512, False)
+        self.d5 = UNetBlock(1024, 256, False)
+        self.d6 = UNetBlock(512, 128, False)
+        self.d7 = UNetBlock(256, 64, False)
+        self.final = nn.Sequential(nn.ConvTranspose2d(128, 3, 4, 2, 1), nn.Tanh())
 
     def forward(self, x):
-        d1 = self.down1(x)
-        d2 = self.down2(d1)
-        d3 = self.down3(d2)
-        d4 = self.down4(d3)
-        d5 = self.down5(d4)
-        d6 = self.down6(d5)
-        d7 = self.down7(d6)
-        bottleneck = self.bottleneck(d7)
-        up1 = self.up1(bottleneck)
-        up2 = self.up2(torch.cat([up1, d7], 1))
-        up3 = self.up3(torch.cat([up2, d6], 1))
-        up4 = self.up4(torch.cat([up3, d5], 1))
-        up5 = self.up5(torch.cat([up4, d4], 1))
-        up6 = self.up6(torch.cat([up5, d3], 1))
-        up7 = self.up7(torch.cat([up6, d2], 1))
-        return self.final(torch.cat([up7, d1], 1))
+        e1 = self.e1(x)
+        e2 = self.e2(e1)
+        e3 = self.e3(e2)
+        e4 = self.e4(e3)
+        e5 = self.e5(e4)
+        e6 = self.e6(e5)
+        e7 = self.e7(e6)
+        b = self.bottleneck(e7)
+        d1 = self.d1(b)
+        d2 = self.d2(torch.cat([d1, e7], 1))
+        d3 = self.d3(torch.cat([d2, e6], 1))
+        d4 = self.d4(torch.cat([d3, e5], 1))
+        d5 = self.d5(torch.cat([d4, e4], 1))
+        d6 = self.d6(torch.cat([d5, e3], 1))
+        d7 = self.d7(torch.cat([d6, e2], 1))
+        return self.final(torch.cat([d7, e1], 1))
+
+
+# ── Kaggle-style output conversion ────────────────────────────────────────────
+def to_ndvi_image(tensor_output: 'torch.Tensor') -> np.ndarray:
+    """Convert model output tensor to [0,1] RGB numpy array.
+    Matches the Kaggle evaluation notebook's to_numpy function exactly.
+    """
+    img = tensor_output.squeeze(0).cpu().detach().numpy()   # (3, H, W)
+    img = np.transpose(img, (1, 2, 0))                     # (H, W, 3)
+    return np.clip(img * 0.5 + 0.5, 0, 1)                  # [-1,1] → [0,1]
+
+
+def ndvi_from_rgb(pred_rgb: np.ndarray) -> np.ndarray:
+    """Derive a single-channel NDVI proxy from the model's 3-channel output.
+    Uses luminance weighting to extract vegetation intensity.
+    """
+    return 0.2989 * pred_rgb[:, :, 0] + 0.5870 * pred_rgb[:, :, 1] + 0.1140 * pred_rgb[:, :, 2]
 
 
 # ── NDVI colormap (RdYlGn — multi-stop, matplotlib-equivalent) ────────────────
+# Kept as fallback for the mock/no-model path
 def ndvi_colormap(ndvi_norm: np.ndarray) -> np.ndarray:
     """Map [0,1] NDVI values to a proper RdYlGn RGB heatmap with 6 color stops."""
     ndvi_norm = np.clip(ndvi_norm, 0, 1)
-    # 6-stop RdYlGn: deep red → red → orange → yellow → yellow-green → green
     stops = np.array([
-        [0.0,  0.647, 0.059, 0.082],  # #a50f15  deep red
-        [0.2,  0.906, 0.259, 0.204],  # #e74233  red
-        [0.4,  0.992, 0.682, 0.318],  # #fdae51  orange
-        [0.5,  1.000, 1.000, 0.600],  # #ffff99  yellow
-        [0.7,  0.651, 0.851, 0.416],  # #a6d96a  yellow-green
-        [0.85, 0.263, 0.671, 0.278],  # #43ab47  green
-        [1.0,  0.004, 0.408, 0.216],  # #016837  dark green
+        [0.0,  0.647, 0.059, 0.082],  # deep red
+        [0.2,  0.906, 0.259, 0.204],  # red
+        [0.4,  0.992, 0.682, 0.318],  # orange
+        [0.5,  1.000, 1.000, 0.600],  # yellow
+        [0.7,  0.651, 0.851, 0.416],  # yellow-green
+        [0.85, 0.263, 0.671, 0.278],  # green
+        [1.0,  0.004, 0.408, 0.216],  # dark green
     ])
     r = np.interp(ndvi_norm, stops[:, 0], stops[:, 1])
     g = np.interp(ndvi_norm, stops[:, 0], stops[:, 2])
@@ -174,24 +186,18 @@ def ndvi_colormap(ndvi_norm: np.ndarray) -> np.ndarray:
     return (rgb * 255).astype(np.uint8)
 
 
-def postprocess_ndvi(ndvi_arr: np.ndarray) -> np.ndarray:
-    """Post-processing pipeline per Evion spec:
-    1. Percentile-based histogram stretch (use full [0,1] range)
-    2. Gaussian smooth (edge-preserving via PIL)
+def postprocess_ndvi_image(pred_rgb: np.ndarray) -> np.ndarray:
+    """Light postprocessing for the 3-channel model output.
+    Uses gentle histogram stretch (1st–99th percentile) per channel.
     """
-    # ── Histogram stretch (2nd–98th percentile) ──────────────────────────────
-    p2  = np.percentile(ndvi_arr, 2)
-    p98 = np.percentile(ndvi_arr, 98)
-    if (p98 - p2) > 0.01:
-        ndvi_arr = (ndvi_arr - p2) / (p98 - p2)
-    ndvi_arr = np.clip(ndvi_arr, 0, 1)
-
-    # ── Median filter (edge-preserving, removes speckle without smearing) ────
-    smooth_img = Image.fromarray((ndvi_arr * 255).astype(np.uint8), mode='L')
-    smooth_img = smooth_img.filter(ImageFilter.MedianFilter(size=3))
-    ndvi_arr = np.array(smooth_img).astype(np.float32) / 255.0
-
-    return ndvi_arr
+    result = np.copy(pred_rgb)
+    for ch in range(3):
+        p1 = np.percentile(result[:, :, ch], 1)
+        p99 = np.percentile(result[:, :, ch], 99)
+        if (p99 - p1) > 0.01:
+            result[:, :, ch] = (result[:, :, ch] - p1) / (p99 - p1)
+    result = np.clip(result, 0, 1)
+    return result
 
 
 # ── Model loading ─────────────────────────────────────────────────────────────
@@ -207,10 +213,11 @@ async def load_model():
 
         gen = Generator().to(DEVICE)
 
-        # Handle different checkpoint formats gracefully
+        # Checkpoint key: "generator_state" (verified from Kaggle evaluation notebook)
         if isinstance(checkpoint, dict):
             sd = (
-                checkpoint.get("generator_state_dict")
+                checkpoint.get("generator_state")
+                or checkpoint.get("generator_state_dict")
                 or checkpoint.get("model_state_dict")
                 or checkpoint.get("state_dict")
                 or checkpoint.get("gen")
@@ -219,10 +226,17 @@ async def load_model():
         else:
             sd = checkpoint
 
-        gen.load_state_dict(sd, strict=False)
+        # Log checkpoint info if available
+        if isinstance(checkpoint, dict):
+            epoch = checkpoint.get("epoch", "?")
+            g_loss = checkpoint.get("g_loss", "?")
+            logger.info(f"Checkpoint info — epoch: {epoch}, g_loss: {g_loss}")
+            logger.info(f"Checkpoint keys: {list(checkpoint.keys())}")
+
+        gen.load_state_dict(sd, strict=True)  # strict=True to catch architecture mismatches
         gen.eval()
         model = gen
-        logger.info("✅ Model loaded successfully")
+        logger.info("✅ Model loaded successfully (strict=True, all weights matched)")
     except Exception as e:
         logger.error(f"❌ Model load failed: {e}")
         logger.warning("Running with MOCK predictions — set HF_REPO_ID + HF_TOKEN or MODEL_PATH.")
@@ -244,15 +258,16 @@ def encode_image(img: Image.Image) -> str:
     return base64.b64encode(buf.getvalue()).decode()
 
 
-def compute_statistics(ndvi_arr: np.ndarray) -> dict:
+def compute_statistics(ndvi_single: np.ndarray) -> dict:
+    """Compute NDVI statistics from a single-channel [0,1] NDVI proxy."""
     return {
-        "mean_ndvi":    round(float(np.mean(ndvi_arr)), 4),
-        "max_ndvi":     round(float(np.max(ndvi_arr)), 4),
-        "min_ndvi":     round(float(np.min(ndvi_arr)), 4),
-        # Real-world NDVI thresholds: >0.6 healthy, 0.3-0.6 stressed, <0.3 barren
-        "healthy_pct":  round(float(np.mean(ndvi_arr > 0.6)) * 100, 2),
-        "stressed_pct": round(float(np.mean((ndvi_arr >= 0.3) & (ndvi_arr <= 0.6))) * 100, 2),
-        "barren_pct":   round(float(np.mean(ndvi_arr < 0.3)) * 100, 2),
+        "mean_ndvi":    round(float(np.mean(ndvi_single)), 4),
+        "max_ndvi":     round(float(np.max(ndvi_single)), 4),
+        "min_ndvi":     round(float(np.min(ndvi_single)), 4),
+        # Thresholds applied to luminance-derived NDVI proxy
+        "healthy_pct":  round(float(np.mean(ndvi_single > 0.6)) * 100, 2),
+        "stressed_pct": round(float(np.mean((ndvi_single >= 0.3) & (ndvi_single <= 0.6))) * 100, 2),
+        "barren_pct":   round(float(np.mean(ndvi_single < 0.3)) * 100, 2),
     }
 
 
@@ -298,8 +313,24 @@ async def analyze(file: UploadFile = File(...)):
     if model is not None:
         tensor = transform(orig_resized).unsqueeze(0).to(DEVICE)
         with torch.no_grad():
-            pred = model(tensor)                       # (1, 1, H, W) in [-1, 1]
-        ndvi_arr = 1.0 - (pred.squeeze().cpu().numpy() + 1) / 2  # model: -1=veg, +1=barren → flip
+            pred = model(tensor)                       # (1, 3, H, W) in [-1, 1]
+
+        # ── Kaggle-style denormalization: (x+1)/2, NO inversion ──────────────
+        pred_rgb = to_ndvi_image(pred)                 # (H, W, 3) in [0, 1]
+
+        # ── Derive single-channel NDVI for statistics ────────────────────────
+        ndvi_single = ndvi_from_rgb(pred_rgb)
+
+        # ── Statistics on raw NDVI (before any postprocessing) ────────────────
+        stats = compute_statistics(ndvi_single)
+
+        # ── Apply RdYlGn colormap to single-channel NDVI for farmer-friendly visualization
+        p1, p99 = np.percentile(ndvi_single, 1), np.percentile(ndvi_single, 99)
+        if (p99 - p1) > 0.01:
+            ndvi_single = (ndvi_single - p1) / (p99 - p1)
+        ndvi_single = np.clip(ndvi_single, 0, 1)
+        heatmap_rgb = ndvi_colormap(ndvi_single)
+        heatmap_img = Image.fromarray(heatmap_rgb)
     else:
         # Graceful mock: compute rough NDVI-like map from R/G channels
         arr = np.array(orig_resized).astype(np.float32) / 255.0
@@ -308,23 +339,19 @@ async def analyze(file: UploadFile = File(...)):
         denom = nir_approx + red + 1e-6
         ndvi_arr = np.clip((nir_approx - red) / denom, 0, 1)
 
-    # ── Statistics on raw NDVI (before stretch, so thresholds are meaningful) ─
-    stats = compute_statistics(ndvi_arr)
+        stats = compute_statistics(ndvi_arr)
 
-    # ── Post-processing for visualization only ───────────────────────────────
-    ndvi_arr = postprocess_ndvi(ndvi_arr)
-
-    # ── Colormap heatmap ──────────────────────────────────────────────────────
-    heatmap_rgb = ndvi_colormap(ndvi_arr)
-    heatmap_img = Image.fromarray(heatmap_rgb)
+        # Apply colormap for the mock path
+        heatmap_rgb = ndvi_colormap(ndvi_arr)
+        heatmap_img = Image.fromarray(heatmap_rgb)
 
     # ── Upscale 256 → 512 (sharper display without re-running model) ─────────
     heatmap_img = heatmap_img.resize((OUTPUT_SIZE, OUTPUT_SIZE), Image.LANCZOS)
     orig_display = orig_resized.resize((OUTPUT_SIZE, OUTPUT_SIZE), Image.LANCZOS)
 
-    # ── HSV saturation boost ×1.4 (per pipeline spec) ────────────────────────
+    # ── Light saturation boost ×1.2 (gentler than before) ────────────────────
     from PIL import ImageEnhance
-    heatmap_img = ImageEnhance.Color(heatmap_img).enhance(1.4)
+    heatmap_img = ImageEnhance.Color(heatmap_img).enhance(1.2)
 
     # ── Blended overlay ───────────────────────────────────────────────────────
     overlay = Image.blend(orig_display.convert("RGB"), heatmap_img, alpha=0.55)
