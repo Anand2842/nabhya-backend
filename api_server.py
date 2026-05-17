@@ -8,8 +8,8 @@ Model source priority:
   2. Local path       — set MODEL_PATH env var (or uses sibling best_model.pth)
 """
 
-from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, UploadFile, File, HTTPException, Request
+from fastapi.responses import JSONResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image, ImageFilter
 import torch
@@ -20,6 +20,9 @@ import io
 import base64
 import logging
 import os
+import time
+import cv2
+from scipy import ndimage
 
 try:
     from huggingface_hub import hf_hub_download
@@ -44,6 +47,23 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ── API Keys ─────────────────────────────────────────────────────────────────
+VALID_KEYS = {
+    "nbhya_demo_key_001": {"plan": "starter", "limit": 2000, "used": 0},
+    "nbhya_test_key_002": {"plan": "growth",  "limit": 6000, "used": 0},
+}
+
+def verify_key(request: Request):
+    key = request.headers.get("X-Nabhya-Key")
+    if not key:
+        return None, "API key required"
+    if key not in VALID_KEYS:
+        return None, "Invalid API key"
+    account = VALID_KEYS[key]
+    if account["used"] >= account["limit"]:
+        return None, "Monthly limit reached"
+    return account, None
 
 # ── Device ───────────────────────────────────────────────────────────────────
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -270,6 +290,164 @@ def compute_statistics(ndvi_single: np.ndarray) -> dict:
         "barren_pct":   round(float(np.mean(ndvi_single < 0.3)) * 100, 2),
     }
 
+# ── Vegetation Intelligence & Stress Zones ────────────────────────────────────
+
+def compute_health_score(healthy_pct, stressed_pct):
+    return round(healthy_pct * 0.75 + stressed_pct * 0.25, 1)
+
+def compute_health_grade(score):
+    if score >= 85: return "A"
+    if score >= 70: return "B"
+    if score >= 55: return "C"
+    if score >= 40: return "D"
+    return "F"
+
+def compute_action_flag(grade):
+    if grade in ["A", "B"]: return "HEALTHY"
+    if grade == "C": return "MONITOR"
+    return "ALERT"
+
+def stress_severity_index(ndvi_mean, field_average):
+    """
+    Returns 0-100 score where:
+    0   = no stress
+    100 = maximum stress
+    field_average is computed from the actual NDVI array, not hardcoded.
+    """
+    relative_stress = max(0, field_average - ndvi_mean)
+    index = min(100, relative_stress * 200)
+    return round(index, 1)
+
+def detect_stress_zones(ndvi_array, resolution_m=10):
+    """
+    ndvi_array: float32 array 0-1, output of your model (near-NDVI proxy).
+    resolution_m: metres per pixel (assume 10m for Sentinel scale)
+    NOTE: threshold 0.35 was chosen empirically for our near-NDVI proxy.
+    Absolute values may not map exactly to true NDVI. Tuneable later.
+    """
+    # Threshold — stressed pixels (empirical for near-NDVI proxy)
+    stressed_mask = (ndvi_array < 0.35).astype(np.uint8)
+    
+    # Remove noise — small isolated pixels
+    kernel = np.ones((2,2), np.uint8)
+    stressed_mask = cv2.morphologyEx(stressed_mask, 
+                                      cv2.MORPH_OPEN, kernel)
+    
+    # Label connected components — each cluster = one zone
+    labeled, num_zones = ndimage.label(stressed_mask)
+    
+    zones = []
+    field_avg = float(ndvi_array.mean())  # Actual field average, not hardcoded
+    for zone_id in range(1, num_zones + 1):
+        zone_pixels = (labeled == zone_id)
+        pixel_count = zone_pixels.sum()
+        
+        # Filter tiny zones — ~0.5 hectares minimum at Sentinel 10m resolution
+        if pixel_count < 50:
+            continue
+        
+        # Zone stats
+        zone_ndvi = ndvi_array[zone_pixels]
+        ndvi_mean = float(zone_ndvi.mean())
+        ndvi_std  = float(zone_ndvi.std())
+        
+        # Area in hectares
+        area_sqm = pixel_count * (resolution_m ** 2)
+        area_ha   = round(area_sqm / 10000, 2)
+        
+        # Severity
+        if ndvi_mean < 0.2:
+            severity = "CRITICAL"
+        elif ndvi_mean < 0.3:
+            severity = "HIGH"
+        else:
+            severity = "MODERATE"
+        
+        # Bounding box for frontend to draw rectangle
+        rows = np.where(zone_pixels.any(axis=1))[0]
+        cols = np.where(zone_pixels.any(axis=0))[0]
+        bbox = {
+            "x_min": int(cols.min()),
+            "y_min": int(rows.min()),
+            "x_max": int(cols.max()),
+            "y_max": int(rows.max()),
+        }
+        
+        
+        zones.append({
+            "zone_id": f"Z{zone_id:03d}",
+            "severity": severity,
+            "stress_severity_index": stress_severity_index(ndvi_mean, field_avg),
+            "ndvi_mean": round(ndvi_mean, 3),
+            "ndvi_std":  round(ndvi_std, 3),
+            "area_ha":   area_ha,
+            "bbox":      bbox
+        })
+    
+    # Sort by severity then area
+    severity_order = {"CRITICAL": 0, "HIGH": 1, "MODERATE": 2}
+    zones.sort(key=lambda z: (severity_order[z["severity"]], -z["area_ha"]))
+    
+    # Cap at top 15 zones to avoid visual noise
+    zones = zones[:15]
+    
+    # Re-index to ensure sequential zone IDs after filtering
+    for i, z in enumerate(zones):
+        z["zone_id"] = f"Z{i+1:03d}"
+        
+    return zones
+
+def draw_zones_on_heatmap(heatmap_img, zones, scale_factor=2):
+    img = np.array(heatmap_img) # RGB
+    
+    colors = {
+        "CRITICAL": (214, 40, 57),    # red
+        "HIGH":     (244, 167, 38),   # amber  
+        "MODERATE": (144, 190, 109),  # light green
+    }
+    
+    for zone in zones:
+        bb = zone["bbox"]
+        color = colors[zone["severity"]]
+        
+        # Scale bounding box to match the output image size
+        x_min = bb["x_min"] * scale_factor
+        y_min = bb["y_min"] * scale_factor
+        x_max = bb["x_max"] * scale_factor
+        y_max = bb["y_max"] * scale_factor
+        
+        # Draw white outline first (2px wider)
+        cv2.rectangle(img, 
+                      (x_min - 2, y_min - 2), 
+                      (x_max + 2, y_max + 2), 
+                      (255, 255, 255), 1)
+        
+        # Then coloured rectangle on top
+        cv2.rectangle(img, (x_min, y_min), (x_max, y_max), color, 3)
+        
+        # Label setup
+        label = f"{zone['zone_id']} {zone['severity']}"
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = 0.45
+        thickness = 1
+        
+        # Get text size
+        (tw, th), _ = cv2.getTextSize(label, font, font_scale, thickness)
+        
+        # Black background box for label
+        cv2.rectangle(img,
+            (x_min + 3, y_min + 3),
+            (x_min + tw + 9, y_min + th + 9),
+            (0, 0, 0), -1)  # filled black
+        
+        # White text on top
+        cv2.putText(img, label,
+            (x_min + 6, y_min + th + 5),
+            font, font_scale,
+            (255, 255, 255), thickness)
+    
+    return Image.fromarray(img)
+
 
 # ── Routes ────────────────────────────────────────────────────────────────────
 
@@ -288,8 +466,13 @@ def health():
     return {"status": "ok", "model_ready": model is not None}
 
 
+@app.get("/api-docs")
+async def api_docs():
+    return FileResponse("docs.html")
+
+
 @app.post("/analyze")
-async def analyze(file: UploadFile = File(...)):
+async def analyze(request: Request, file: UploadFile = File(...)):
     """
     Upload a satellite image (JPG/PNG) and receive:
     - NDVI heatmap (base64 PNG)
@@ -306,9 +489,17 @@ async def analyze(file: UploadFile = File(...)):
     except Exception:
         raise HTTPException(400, "Cannot decode uploaded file as an image.")
 
+    account, err_msg = verify_key(request)
+    # Note: Opt-in auth logic. If no key, treated as demo mode.
+    # We could reject unauthenticated users here by checking: if not account and key_was_provided...
+    # For now, allow unauthenticated for demo compatibility.
+    if account:
+        account["used"] += 1
+
     orig_resized = orig.resize((INPUT_SIZE, INPUT_SIZE))
     OUTPUT_SIZE = 512  # upscale for sharper display
 
+    t0 = time.time()
     # ── Inference ────────────────────────────────────────────────────────────
     if model is not None:
         tensor = transform(orig_resized).unsqueeze(0).to(DEVICE)
@@ -323,6 +514,9 @@ async def analyze(file: UploadFile = File(...)):
 
         # ── Statistics on raw NDVI (before any postprocessing) ────────────────
         stats = compute_statistics(ndvi_single)
+
+        # ── Preserve raw NDVI for zone detection (before histogram stretch) ──
+        ndvi_raw = ndvi_single.copy()
 
         # ── Apply RdYlGn colormap to single-channel NDVI for farmer-friendly visualization
         p1, p99 = np.percentile(ndvi_single, 1), np.percentile(ndvi_single, 99)
@@ -356,11 +550,61 @@ async def analyze(file: UploadFile = File(...)):
     # ── Blended overlay ───────────────────────────────────────────────────────
     overlay = Image.blend(orig_display.convert("RGB"), heatmap_img, alpha=0.55)
 
+    inference_time_ms = int((time.time() - t0) * 1000)
+
+    # ── Compute Intelligence & Zones ──────────────────────────────────────────
+    # Use raw (pre-stretch) NDVI for zone detection so thresholds are meaningful
+    ndvi_array_for_zones = ndvi_raw if model is not None else ndvi_arr
+    zones = detect_stress_zones(ndvi_array_for_zones, resolution_m=10)
+    
+    # Draw zones on upscaled heatmap
+    annotated_heatmap = draw_zones_on_heatmap(heatmap_img, zones, scale_factor=2) # 256→512 upscale
+
+    # Overall metrics
+    score = compute_health_score(stats["healthy_pct"], stats["stressed_pct"])
+    grade = compute_health_grade(score)
+    flag = compute_action_flag(grade)
+
+    if stats["healthy_pct"] > 70:
+        dominant_condition = "Healthy with moderate stress patches" if stats["stressed_pct"] > 10 else "Optimal vegetation health"
+    elif stats["stressed_pct"] > 40:
+        dominant_condition = "Widespread vegetation stress detected"
+    else:
+        dominant_condition = "Mixed health, significant bare soil areas"
+
+    total_stressed_ha = sum(z["area_ha"] for z in zones)
+
     return JSONResponse({
         "status": "success",
-        "model_used": model is not None,
-        "statistics": stats,
-        "heatmap_base64":  encode_image(heatmap_img),
-        "overlay_base64":  encode_image(overlay),
+        "nabhya_version": "1.0",
+        "auth": "verified" if account else "demo",
+        "inference_time_ms": inference_time_ms,
+        "image_resolution": f"{OUTPUT_SIZE}x{OUTPUT_SIZE}",
+        "vegetation_intelligence": {
+            "overall_health_score": score,
+            "health_grade": grade,
+            "zones": {
+                "healthy_pct": stats["healthy_pct"],
+                "stressed_pct": stats["stressed_pct"],
+                "barren_pct": stats["barren_pct"]
+            },
+            "dominant_condition": dominant_condition,
+            "action_flag": flag
+        },
+        "stress_zones": zones,
+        "total_stress_zones": len(zones),
+        "total_stressed_ha": round(total_stressed_ha, 2),
+        "heatmap_base64": encode_image(heatmap_img),
+        "annotated_heatmap_base64": encode_image(annotated_heatmap),
+        "overlay_base64": encode_image(overlay),
         "original_base64": encode_image(orig_display),
+        # Legacy key for backward compat
+        "statistics": stats,
+        "model_used": model is not None,
+        "metadata": {
+            "model": "Pix2Pix UNet" if model is not None else "Mock RGB Logic",
+            "training_images": 2200 if model is not None else 0,
+            "ssim_benchmark": 0.8060 if model is not None else None,
+            "processed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        }
     })

@@ -25,10 +25,13 @@ RUN pip install --no-cache-dir \
         pillow==10.3.0 \
         numpy==1.26.4 \
         python-multipart==0.0.9 \
-        "huggingface_hub>=0.23.0"
+        "huggingface_hub>=0.23.0" \
+        "opencv-python-headless>=4.9.0" \
+        "scipy>=1.12.0"
 
 # ── App code ──────────────────────────────────────────────────────────────────
 COPY api_server.py .
+COPY docs.html .
 
 # ── HF Spaces requires port 7860 ──────────────────────────────────────────────
 EXPOSE 7860
